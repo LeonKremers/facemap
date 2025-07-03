@@ -2,17 +2,16 @@
 Copright © 2023 Howard Hughes Medical Institute, Authored by Carsen Stringer and Atika Syeda.
 Adapted 2025 by Leon Kremers, University of Bonn
 """
+
 import os
 import sys
 import time
 from io import StringIO
-import multiprocessing as mp
-from functools import partial
-
 import numpy as np
 from numba import vectorize
 from scipy import io
 from tqdm.notebook import tqdm
+from joblib import Parallel, delayed
 
 from facemap import pupil, running, utils
 
@@ -107,7 +106,7 @@ def subsampled_mean(
 
 
 def compute_SVD(
-    containers,
+    filenames,
     cumframes,
     Ly,
     Lx,
@@ -146,53 +145,32 @@ def compute_SVD(
 
     # binned Ly and Lx and their relative inds in concatenated movies
     Lyb, Lxb, ir = binned_inds(Ly, Lx, sbin)
-    if fullSVD:
-        U_mot = (
-            [np.zeros(((Lyb * Lxb).sum(), nsegs * nc), np.float32)] if motSVD else []
-        )
-        U_mov = (
-            [np.zeros(((Lyb * Lxb).sum(), nsegs * nc), np.float32)] if movSVD else []
-        )
-    else:
-        U_mot = [np.zeros((0, 1), np.float32)] if motSVD else []
-        U_mov = [np.zeros((0, 1), np.float32)] if movSVD else []
+
     nroi = 0
     motind = []
     ivid = []
-
-    ni_mot = []
-    ni_mot.append(0)
-    ni_mov = []
-    ni_mov.append(0)
     if rois is not None:
         for i, r in enumerate(rois):
             ivid.append(r["ivid"])
             if r["rind"] == 1:
-                nroi += 1
                 motind.append(i)
-                nyb = r["yrange_bin"].size
-                nxb = r["xrange_bin"].size
-                U_mot.append(
-                    np.zeros((nyb * nxb, nsegs * min(nc, nyb * nxb)), np.float32)
-                )
-                U_mov.append(
-                    np.zeros((nyb * nxb, nsegs * min(nc, nyb * nxb)), np.float32)
-                )
-                ni_mot.append(0)
-                ni_mov.append(0)
+                nroi += 1
     ivid = np.array(ivid).astype(np.int32)
     motind = np.array(motind)
 
-    ns = 0
-    w = StringIO()
-    tic = time.time()
-    for n in tqdm(range(nsegs), desc="Computing SVD", file=sys.stdout):
+    def _process_chunk_svd(n):
+        _, _, _, containers = utils.get_frame_details(filenames)
         img = imall_init(nt0, Ly, Lx)
         t = tf[n]
         utils.get_frames(img, containers, np.arange(t, t + nt0), cumframes)
+
+        mot_parts = [None] * (1 + nroi)
+        mov_parts = [None] * (1 + nroi)
+
         if fullSVD:
             imall_mot = np.zeros((img[0].shape[0] - 1, (Lyb * Lxb).sum()), np.float32)
             imall_mov = np.zeros((img[0].shape[0] - 1, (Lyb * Lxb).sum()), np.float32)
+
         for ii, im in enumerate(img):
             usevid = False
             if fullSVD:
@@ -226,77 +204,88 @@ def compute_SVD(
                         ymax = rois[wroi[i]]["yrange_bin"][-1] + 1
                         xmin = rois[wroi[i]]["xrange_bin"][0]
                         xmax = rois[wroi[i]]["xrange_bin"][-1] + 1
+
+                        u_mot_idx = wmot[i] + 1
+
                         if motSVD:
                             lilbin = imbin_mot[:, ymin:ymax, xmin:xmax]
                             lilbin = np.reshape(lilbin, (lilbin.shape[0], -1))
                             ncb = min(nc, lilbin.shape[-1])
                             usv = utils.svdecon(lilbin.T, k=ncb)
-                            ncb = usv[0].shape[-1]
-                            u0, uend = ni_mot[wmot[i] + 1], ni_mot[wmot[i] + 1] + ncb
-                            U_mot[wmot[i] + 1][:, u0:uend] = usv[0] * usv[1]
-                            ni_mot[wmot[i] + 1] += ncb
+                            mot_parts[u_mot_idx] = usv[0] * usv[1]
                         if movSVD:
                             lilbin = imbin_mov[:, ymin:ymax, xmin:xmax]
                             lilbin = np.reshape(lilbin, (lilbin.shape[0], -1))
                             ncb = min(nc, lilbin.shape[-1])
                             usv = utils.svdecon(lilbin.T, k=ncb)
-                            ncb = usv[0].shape[-1]
-                            u0, uend = ni_mov[wmot[i] + 1], ni_mov[wmot[i] + 1] + ncb
-                            U_mov[wmot[i] + 1][:, u0:uend] = usv[0] * usv[1]
-                            ni_mov[wmot[i] + 1] += ncb
-            if n % 5 == 0:  # Print every 5 chunks instead of every chunk to reduce spam
-                print(f"computed svd chunk {n} / {nsegs}, time {time.time()-tic: .2f}sec", file=sys.stdout)
-        utils.update_mainwindow_progressbar(MainWindow, GUIobject, w, "Computing SVD ")
+                            mov_parts[u_mot_idx] = usv[0] * usv[1]
 
         if fullSVD:
             if motSVD:
                 ncb = min(nc, imall_mot.shape[-1])
                 usv = utils.svdecon(imall_mot.T, k=ncb)
-                ncb = usv[0].shape[-1]
-                U_mot[0][:, ni_mot[0] : ni_mot[0] + ncb] = usv[0] * usv[1]
-                ni_mot[0] += ncb
+                mot_parts[0] = usv[0] * usv[1]
             if movSVD:
                 ncb = min(nc, imall_mov.shape[-1])
                 usv = utils.svdecon(imall_mov.T, k=ncb)
-                ncb = usv[0].shape[-1]
-                U_mov[0][:, ni_mov[0] : ni_mov[0] + ncb] = usv[0] * usv[1]
-                ni_mov[0] += ncb
-        ns += 1
+                mov_parts[0] = usv[0] * usv[1]
+
+        utils.close_videos(containers)
+        return mot_parts, mov_parts
+
+    w = StringIO()
+    tic = time.time()
+
+    # Process chunks in parallel with progress tracking
+    print(f"Processing {nsegs} chunks in parallel...")
+    with Parallel(n_jobs=-1) as parallel:
+        results = []
+        with tqdm(total=nsegs, desc="Computing SVD", file=sys.stdout) as pbar:
+            for result in parallel(
+                delayed(_process_chunk_svd)(n) for n in range(nsegs)
+            ):
+                results.append(result)
+                pbar.update(1)
+
+    U_mot = []
+    U_mov = []
+    if motSVD:
+        U_mot = [
+            np.concatenate(
+                [res[0][i] for res in results if res[0][i] is not None], axis=1
+            )
+            for i in range(1 + nroi)
+        ]
+    if movSVD:
+        U_mov = [
+            np.concatenate(
+                [res[1][i] for res in results if res[1][i] is not None], axis=1
+            )
+            for i in range(1 + nroi)
+        ]
 
     S_mot = np.zeros(500, "float32")
     S_mov = np.zeros(500, "float32")
     # take SVD of concatenated spatial PCs
-    if ns > 1:
+    if nsegs > 1:
         for nr in range(len(U_mot)):
-            if nr == 0 and fullSVD:
-                if motSVD:
-                    U_mot[nr] = U_mot[nr][:, : ni_mot[0]]
-                    usv = utils.svdecon(
-                        U_mot[nr], k=min(ncomps, U_mot[nr].shape[0] - 1)
-                    )
-                    U_mot[nr] = usv[0]
+            if U_mot[nr].shape[1] > 0:
+                usv = utils.svdecon(
+                    U_mot[nr],
+                    k=min(ncomps, U_mot[nr].shape[0] - 1, U_mot[nr].shape[1] - 1),
+                )
+                U_mot[nr] = usv[0]
+                if nr == 0:
                     S_mot = usv[1]
-                if movSVD:
-                    U_mov[nr] = U_mov[nr][:, : ni_mov[0]]
-                    usv = utils.svdecon(
-                        U_mov[nr], k=min(ncomps, U_mov[nr].shape[0] - 1)
-                    )
-                    U_mov[nr] = usv[0]
-                    S_mov = usv[1]
-            elif nr > 0:
-                if motSVD:
-                    U_mot[nr] = U_mot[nr][:, : ni_mot[nr]]
-                    usv = utils.svdecon(
-                        U_mot[nr], k=min(ncomps, U_mot[nr].shape[0] - 1)
-                    )
-                    U_mot[nr] = usv[0]
-                    S_mot = usv[1]
-                if movSVD:
-                    U_mov[nr] = U_mov[nr][:, : ni_mov[nr]]
-                    usv = utils.svdecon(
-                        U_mov[nr], k=min(ncomps, U_mov[nr].shape[0] - 1)
-                    )
-                    U_mov[nr] = usv[0]
+
+        for nr in range(len(U_mov)):
+            if U_mov[nr].shape[1] > 0:
+                usv = utils.svdecon(
+                    U_mov[nr],
+                    k=min(ncomps, U_mov[nr].shape[0] - 1, U_mov[nr].shape[1] - 1),
+                )
+                U_mov[nr] = usv[0]
+                if nr == 0:
                     S_mov = usv[1]
 
     utils.update_mainwindow_message(MainWindow, GUIobject, "Finished computing svd")
@@ -321,29 +310,8 @@ def process_ROIs(
     fullSVD=True,
     GUIobject=None,
     MainWindow=None,
-    use_parallel=False,
-    n_processes=None
 ):
-    """
-    Process ROIs with optional parallel processing
-    
-    Parameters
-    ----------
-    use_parallel : bool
-        If True, use multiprocessing for speed improvement
-    n_processes : int or None
-        Number of processes to use (None = auto-detect)
-    """
-    if use_parallel:
-        return process_ROIs_parallel(
-            containers, cumframes, Ly, Lx, avgframe, avgmotion,
-            U_mot, U_mov, motSVD, movSVD, sbin, tic, rois, fullSVD,
-            GUIobject, MainWindow, n_processes
-        )
-    
-    # Original sequential implementation
-    if tic is None:
-        tic = time.time()
+
     nframes = cumframes[-1]
 
     pups = []
@@ -536,7 +504,8 @@ def process_ROIs(
 
             if n % 10 == 0:
                 print(
-                    f"computed video chunk {n} / {nsegs}, time {time.time()-tic: .2f}sec", file=sys.stdout
+                    f"computed video chunk {n} / {nsegs}, time {time.time()-tic: .2f}sec",
+                    file=sys.stdout,
                 )
 
             utils.update_mainwindow_progressbar(
@@ -547,191 +516,6 @@ def process_ROIs(
         MainWindow, GUIobject, "Finished computing ROIs and/or motSVD/movSVD "
     )
 
-    return V_mot, V_mov, M, pups, blinks, runs
-
-
-def process_video_chunk_parallel(chunk_args):
-    """Process a single chunk of video frames in parallel"""
-    (chunk_idx, t_start, t_end, containers, cumframes, Ly, Lx, 
-     avgframe, avgmotion, U_mot, U_mov, motSVD, movSVD, sbin, 
-     rois, fullSVD, ivid, motind, pupind, blind, runind) = chunk_args
-    
-    nt0 = t_end - t_start
-    img = imall_init(nt0, Ly, Lx)
-    utils.get_frames(img, containers, np.arange(t_start, t_end), cumframes)
-    nt1 = img[0].shape[0]
-    
-    # Initialize results for this chunk
-    chunk_results = {
-        'chunk_idx': chunk_idx,
-        't_start': t_start,
-        't_end': t_end,
-        'nt1': nt1,
-        'pups': None,
-        'blinks': None,
-        'runs': None,
-        'V_mot_data': None,
-        'V_mov_data': None,
-        'M_data': None
-    }
-    
-    # Process pupil, blinks, running for this chunk
-    if len(pupind) > 0:
-        # Process pupil ROIs for this chunk
-        pass  # Implement pupil processing
-    
-    if len(blind) > 0:
-        # Process blink ROIs for this chunk  
-        pass  # Implement blink processing
-        
-    if len(runind) > 0:
-        # Process running ROIs for this chunk
-        pass  # Implement running processing
-    
-    # Process motion SVD for this chunk
-    if fullSVD:
-        Lyb, Lxb, ir = binned_inds(Ly, Lx, sbin)
-        if motSVD and U_mot:
-            # Process motion SVD
-            pass
-        if movSVD and U_mov:
-            # Process movie SVD  
-            pass
-    
-    return chunk_results
-
-def process_ROIs_parallel(
-    containers,
-    cumframes,
-    Ly,
-    Lx,
-    avgframe,
-    avgmotion,
-    U_mot,
-    U_mov,
-    motSVD=True,
-    movSVD=False,
-    sbin=3,
-    tic=None,
-    rois=None,
-    fullSVD=True,
-    GUIobject=None,
-    MainWindow=None,
-    n_processes=None
-):
-    """Parallel version of process_ROIs using multiprocessing"""
-    if tic is None:
-        tic = time.time()
-    
-    nframes = cumframes[-1]
-    
-    # Determine number of processes
-    if n_processes is None:
-        n_processes = min(mp.cpu_count() - 1, 64)  # Leave 1 core free, max 4 processes
-    
-    print(f"Using {n_processes} parallel processes", file=sys.stdout)
-    
-    # ...existing ROI setup code...
-    pups = []
-    pupreflector = []
-    blinks = []
-    runs = []
-    motind = []
-    pupind = []
-    blind = []
-    runind = []
-    ivid = []
-    nroi = 0
-    
-    if fullSVD:
-        if motSVD:
-            ncomps_mot = U_mot[0].shape[-1]
-        if movSVD:
-            ncomps_mov = U_mov[0].shape[-1]
-        V_mot = [np.zeros((nframes, ncomps_mot), np.float32)] if motSVD else []
-        V_mov = [np.zeros((nframes, ncomps_mov), np.float32)] if movSVD else []
-        M = [np.zeros((nframes), np.float32)]
-    else:
-        V_mot = [np.zeros((0, 1), np.float32)] if motSVD else []
-        V_mov = [np.zeros((0, 1), np.float32)] if movSVD else []
-        M = [np.zeros((0,), np.float32)]
-
-    if rois is not None:
-        for i, r in enumerate(rois):
-            ivid.append(r["ivid"])
-            if r["rind"] == 0:
-                pupind.append(i)
-                pups.append({
-                    "area": np.zeros((nframes,)),
-                    "com": np.zeros((nframes, 2)),
-                    "axdir": np.zeros((nframes, 2, 2)),
-                    "axlen": np.zeros((nframes, 2)),
-                })
-                if "reflector" in r:
-                    pupreflector.append(
-                        utils.get_reflector(r["yrange"], r["xrange"], rROI=None, rdict=r["reflector"])
-                    )
-                else:
-                    pupreflector.append(np.array([]))
-            elif r["rind"] == 1:
-                motind.append(i)
-                nroi += 1
-                if motSVD:
-                    V_mot.append(np.zeros((nframes, U_mot[nroi].shape[1]), np.float32))
-                if movSVD:
-                    V_mov.append(np.zeros((nframes, U_mov[nroi].shape[1]), np.float32))
-                M.append(np.zeros((nframes,), np.float32))
-            elif r["rind"] == 2:
-                blind.append(i)
-                blinks.append(np.zeros((nframes,)))
-            elif r["rind"] == 3:
-                runind.append(i)
-                runs.append(np.zeros((nframes, 2)))
-
-    ivid = np.array(ivid).astype(np.int32)
-    motind = np.array(motind).astype(np.int32)
-    
-    # Split video into chunks for parallel processing
-    chunk_size = 500  # frames per chunk
-    nsegs = int(np.ceil(nframes / chunk_size))
-    
-    # Create chunk arguments
-    chunk_args = []
-    for n in range(nsegs):
-        t_start = n * chunk_size
-        t_end = min((n + 1) * chunk_size, nframes)
-        
-        chunk_args.append((
-            n, t_start, t_end, containers, cumframes, Ly, Lx,
-            avgframe, avgmotion, U_mot, U_mov, motSVD, movSVD, sbin,
-            rois, fullSVD, ivid, motind, pupind, blind, runind
-        ))
-    
-    print(f"Processing {nsegs} chunks in parallel...", file=sys.stdout)
-    
-    # Process chunks in parallel
-    with mp.Pool(processes=n_processes) as pool:
-        chunk_results = list(tqdm(
-            pool.imap(process_video_chunk_parallel, chunk_args),
-            total=len(chunk_args),
-            desc="Processing video chunks",
-            file=sys.stdout
-        ))
-    
-    # Combine results from all chunks
-    print("Combining parallel results...", file=sys.stdout)
-    for result in chunk_results:
-        # Combine chunk results into final arrays
-        if result['V_mot_data'] is not None:
-            # Merge V_mot data
-            pass
-        if result['V_mov_data'] is not None:
-            # Merge V_mov data
-            pass
-        # Merge other results...
-    
-    print("Parallel processing completed", file=sys.stdout)
-    
     return V_mot, V_mov, M, pups, blinks, runs
 
 
@@ -851,7 +635,7 @@ def run(
     savepath=None,
 ):
     """
-    Process video files using SVD computation of motion and/or raw movie data. 
+    Process video files using SVD computation of motion and/or raw movie data.
     Parameters
     ----------
     filenames: 2D-list
@@ -878,7 +662,7 @@ def run(
     """
     start = time.time()
     print("Starting facemap processing...", file=sys.stdout)
-    
+
     # grab files
     rois = None
     sy, sx = 0, 0
@@ -914,7 +698,9 @@ def run(
             rois = proc["rois"]
             sy = proc["sy"]
             sx = proc["sx"]
-            savepath = proc["savepath"] if savepath is None else savepath #proc["savepath"] if savepath is not None else savepath
+            savepath = (
+                proc["savepath"] if savepath is None else savepath
+            )  # proc["savepath"] if savepath is not None else savepath
             print(f"Save path: {savepath}", file=sys.stdout)
 
     Lybin, Lxbin, iinds = binned_inds(Ly, Lx, sbin)
@@ -975,7 +761,7 @@ def run(
     if fullSVD or nroi > 0:
         print("Computing subsampled SVD...", file=sys.stdout)
         U_mot, U_mov, S_mot, S_mov = compute_SVD(
-            containers,
+            filenames,
             cumframes,
             Ly,
             Lx,
@@ -990,7 +776,9 @@ def run(
             GUIobject=GUIobject,
             MainWindow=parent,
         )
-        print("Computed subsampled SVD at %0.2fs" % (time.time() - tic), file=sys.stdout)
+        print(
+            "Computed subsampled SVD at %0.2fs" % (time.time() - tic), file=sys.stdout
+        )
 
         if parent is not None:
             parent.update_status_bar("Computed subsampled SVD")
@@ -1030,7 +818,7 @@ def run(
     # Add V_mot and/or V_mov calculation: project U onto all movie frames ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     # and compute pupil (if selected)
     print("Computing ROIs and/or motSVD/movSVD", file=sys.stdout)
-    V_mot, V_mov, M, pups, blinks, runs = process_ROIs_parallel(
+    V_mot, V_mov, M, pups, blinks, runs = process_ROIs(
         containers,
         cumframes,
         Ly,
@@ -1047,10 +835,11 @@ def run(
         fullSVD=fullSVD,
         GUIobject=GUIobject,
         MainWindow=parent,
-        use_parallel=True,  # Enable parallel processing
-        n_processes=64,      # Use n process, if None use auto-detect-1 process to a maximum of 64
     )
-    print("Computed ROIS and/or motSVD/movSVD at %0.2fs" % (time.time() - tic), file=sys.stdout)
+    print(
+        "Computed ROIS and/or motSVD/movSVD at %0.2fs" % (time.time() - tic),
+        file=sys.stdout,
+    )
 
     # smooth pupil and blinks and running  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     for p in pups:

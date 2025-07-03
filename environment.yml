@@ -19,4 +19,5 @@ dependencies:
     - qtpy
     - pyqt6
     - umap-learn
+    - joblib
 
