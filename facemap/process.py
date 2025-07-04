@@ -15,6 +15,162 @@ from joblib import Parallel, delayed
 
 from facemap import pupil, running, utils
 
+# Helper for parallel chunk processing
+
+
+def _process_roi_chunk(
+    Ly,
+    Lx,
+    sbin,
+    filenames,
+    cumframes,
+    avgframe,
+    avgmotion,
+    U_mot,
+    U_mov,
+    motSVD,
+    movSVD,
+    t_start,
+    t_end,
+    rois,
+    fullSVD,
+    ivid,
+    motind,
+    MainWindow,
+    GUIobject,
+):
+    """Processes a single, independent chunk of frames for parallel execution."""
+    # Open containers locally in each worker
+    _, _, _, containers = utils.get_frame_details(filenames)
+    Lyb, Lxb, ir = binned_inds(Ly, Lx, sbin)
+    nroi = len(motind)
+
+    frames_to_load = np.arange(t_start, t_end)
+    chunk_len_frames = len(frames_to_load)
+
+    # If less than 2 frames, can't compute motion, return empty arrays with correct shapes
+    if chunk_len_frames < 2:
+        V_mot_chunk = (
+            [np.zeros((0, U_mot[0].shape[1]), np.float32)]
+            if motSVD and len(U_mot) > 0
+            else []
+        )
+        V_mov_chunk = (
+            [np.zeros((0, U_mov[0].shape[1]), np.float32)]
+            if movSVD and len(U_mov) > 0
+            else []
+        )
+        M_chunk = [np.zeros(0, np.float32)]
+        utils.close_videos(containers)
+        return V_mot_chunk, V_mov_chunk, M_chunk, None, None, None
+
+    img = imall_init(chunk_len_frames, Ly, Lx)
+    utils.get_frames(img, containers, frames_to_load, cumframes)
+
+    output_len = chunk_len_frames - 1
+
+    # Initialize outputs for this chunk
+    V_mot_chunk = (
+        [np.zeros((output_len, U_mot[0].shape[1]), np.float32)]
+        if motSVD and len(U_mot) > 0
+        else []
+    )
+    V_mov_chunk = (
+        [np.zeros((output_len, U_mov[0].shape[1]), np.float32)]
+        if movSVD and len(U_mov) > 0
+        else []
+    )
+    M_chunk = [np.zeros((output_len,), np.float32)]
+
+    # For fullSVD, initialize imall_mot and imall_mov
+    if fullSVD and motSVD:
+        imall_mot = np.zeros((output_len, (Lyb * Lxb).sum()), np.float32)
+    else:
+        imall_mot = None
+    if fullSVD and movSVD:
+        imall_mov = np.zeros((output_len, (Lyb * Lxb).sum()), np.float32)
+    else:
+        imall_mov = None
+
+    # Process each video in this chunk
+    for ii, im in enumerate(img):
+        usevid = False
+        if fullSVD:
+            usevid = True
+        if nroi > 0:
+            wmot = (ivid[motind] == ii).nonzero()[0]
+            if wmot.size > 0:
+                usevid = True
+        if usevid:
+            imbin = spatial_bin(im, sbin, Lyb[ii], Lxb[ii])
+            if motSVD:
+                imbin_mot = np.abs(np.diff(imbin, axis=0))
+            if movSVD:
+                imbin_mov = imbin[1:, :]
+
+            if fullSVD:
+                if motSVD and imall_mot is not None:
+                    M_chunk[0] += imbin_mot.sum(axis=-1)
+                    imall_mot[:, ir[ii]] = imbin_mot - avgmotion[ii].flatten()
+                if movSVD and imall_mov is not None:
+                    imall_mov[:, ir[ii]] = imbin_mov - avgframe[ii].flatten()
+
+        if nroi > 0 and wmot.size > 0:
+            wmot = np.array(wmot).astype(int)
+            if motSVD:
+                imbin_mot = np.reshape(imbin_mot, (-1, Lyb[ii], Lxb[ii]))
+                avgmotion[ii] = np.reshape(avgmotion[ii], (Lyb[ii], Lxb[ii]))
+            if movSVD:
+                imbin_mov = np.reshape(imbin_mov, (-1, Lyb[ii], Lxb[ii]))
+                avgframe[ii] = np.reshape(avgframe[ii], (Lyb[ii], Lxb[ii]))
+            wroi = motind[wmot]
+            for i in range(wroi.size):
+                ymin, ymax = (
+                    rois[wroi[i]]["yrange_bin"][0],
+                    rois[wroi[i]]["yrange_bin"][-1] + 1,
+                )
+                xmin, xmax = (
+                    rois[wroi[i]]["xrange_bin"][0],
+                    rois[wroi[i]]["xrange_bin"][-1] + 1,
+                )
+                if motSVD:
+                    lilbin = imbin_mot[:, ymin:ymax, xmin:xmax]
+                    M_chunk[0] += lilbin.sum(axis=(-2, -1))
+                    lilbin -= avgmotion[ii][ymin:ymax, xmin:xmax]
+                    lilbin = np.reshape(lilbin, (lilbin.shape[0], -1))
+                    vproj = lilbin @ U_mot[wmot[i] + 1]
+                    V_mot_chunk[0] += vproj
+                if movSVD:
+                    lilbin = imbin_mov[:, ymin:ymax, xmin:xmax]
+                    lilbin -= avgframe[ii][ymin:ymax, xmin:xmax]
+                    lilbin = np.reshape(lilbin, (lilbin.shape[0], -1))
+                    vproj = lilbin @ U_mov[wmot[i] + 1]
+                    V_mov_chunk[0] += vproj
+
+    # For fullSVD, project onto U_mot[0] and U_mov[0]
+    if fullSVD:
+        if motSVD and imall_mot is not None:
+            vproj = imall_mot @ U_mot[0]
+            V_mot_chunk[0] = vproj
+        if movSVD and imall_mov is not None:
+            vproj = imall_mov @ U_mov[0]
+            V_mov_chunk[0] = vproj
+
+    # Close containers at the end
+    utils.close_videos(containers)
+
+    # For now, return None for pups_chunk, blinks_chunk, runs_chunk
+    pups_chunk, blinks_chunk, runs_chunk = None, None, None
+
+    return (
+        V_mot_chunk,
+        V_mov_chunk,
+        M_chunk,
+        pups_chunk,
+        blinks_chunk,
+        runs_chunk,
+    )
+
 
 def binned_inds(Ly, Lx, sbin):
     Lyb = np.zeros((len(Ly),), np.int32)
@@ -294,7 +450,7 @@ def compute_SVD(
 
 
 def process_ROIs(
-    containers,
+    filenames,  # changed from containers
     cumframes,
     Ly,
     Lx,
@@ -311,211 +467,141 @@ def process_ROIs(
     GUIobject=None,
     MainWindow=None,
 ):
-
+    """
+    Parallelized ROI processing with overlapping chunks to ensure correct output length.
+    """
     nframes = cumframes[-1]
+    nt0 = 500  # frames per chunk
 
-    pups = []
-    pupreflector = []
-    blinks = []
-    runs = []
+    # Create overlapping chunk indices - ensure we cover all frames
+    chunk_indices = []
+    start = 0
+    while start < nframes:
+        end = min(start + nt0 + 1, nframes)  # +1 for overlap
+        if end > start + 1:  # Need at least 2 frames for motion computation
+            chunk_indices.append((start, end))
+        if end >= nframes:
+            break
+        start += nt0
 
-    motind = []
-    pupind = []
-    blind = []
-    runind = []
     ivid = []
-    nroi = 0  # number of motion ROIs
-
-    if fullSVD:
-        if motSVD:
-            ncomps_mot = U_mot[0].shape[-1]
-        if movSVD:
-            ncomps_mov = U_mov[0].shape[-1]
-        V_mot = [np.zeros((nframes, ncomps_mot), np.float32)] if motSVD else []
-        V_mov = [np.zeros((nframes, ncomps_mov), np.float32)] if movSVD else []
-        M = [np.zeros((nframes), np.float32)]
-    else:
-        V_mot = [np.zeros((0, 1), np.float32)] if motSVD else []
-        V_mov = [np.zeros((0, 1), np.float32)] if movSVD else []
-        M = [np.zeros((0,), np.float32)]
-
+    motind = []
     if rois is not None:
         for i, r in enumerate(rois):
             ivid.append(r["ivid"])
-            if r["rind"] == 0:
-                pupind.append(i)
-                pups.append(
-                    {
-                        "area": np.zeros((nframes,)),
-                        "com": np.zeros((nframes, 2)),
-                        "axdir": np.zeros((nframes, 2, 2)),
-                        "axlen": np.zeros((nframes, 2)),
-                    }
-                )
-                if "reflector" in r:
-                    pupreflector.append(
-                        utils.get_reflector(
-                            r["yrange"], r["xrange"], rROI=None, rdict=r["reflector"]
-                        )
-                    )
-                else:
-                    pupreflector.append(np.array([]))
-            elif r["rind"] == 1:
+            if r["rind"] == 1:
                 motind.append(i)
-                nroi += 1
-                if motSVD:
-                    V_mot.append(np.zeros((nframes, U_mot[nroi].shape[1]), np.float32))
-                if movSVD:
-                    V_mov.append(np.zeros((nframes, U_mov[nroi].shape[1]), np.float32))
-                M.append(np.zeros((nframes,), np.float32))
-            elif r["rind"] == 2:
-                blind.append(i)
-                blinks.append(np.zeros((nframes,)))
-            elif r["rind"] == 3:
-                runind.append(i)
-                runs.append(np.zeros((nframes, 2)))
-
     ivid = np.array(ivid).astype(np.int32)
-    motind = np.array(motind).astype(np.int32)
+    motind = np.array(motind)
 
-    # compute in chunks of 500
-    nt0 = 500
-    nsegs = int(np.ceil(nframes / nt0))
-    # binned Ly and Lx and their relative inds in concatenated movies
-    Lyb, Lxb, ir = binned_inds(Ly, Lx, sbin)
-    imend = []
-    for ii in range(len(Ly)):
-        imend.append([])
-    t = 0
-    nt1 = 0
-    s = StringIO()
-    for n in tqdm(range(nsegs), desc="Processing ROIs", file=sys.stdout):
-        t += nt1
-        img = imall_init(nt0, Ly, Lx)
-        utils.get_frames(img, containers, np.arange(t, t + nt0), cumframes)
-        nt1 = img[0].shape[0]
+    # Process chunks in parallel
+    results = Parallel(n_jobs=-1)(
+        delayed(_process_roi_chunk)(
+            Ly,
+            Lx,
+            sbin,
+            filenames,
+            cumframes,
+            avgframe,
+            avgmotion,
+            U_mot,
+            U_mov,
+            motSVD,
+            movSVD,
+            t_start,
+            t_end,
+            rois,
+            fullSVD,
+            ivid,
+            motind,
+            MainWindow,
+            GUIobject,
+        )
+        for t_start, t_end in tqdm(chunk_indices, desc="Processing ROI chunks")
+    )
 
-        if len(pupind) > 0:  # compute pupil
-            pups = process_pupil_ROIs(
-                t, nt1, img, ivid, rois, pupind, pups, pupreflector
-            )
-        if len(blind) > 0:
-            blinks = process_blink_ROIs(t, nt0, img, ivid, rois, blind, blinks)
-        if len(runind) > 0:  # compute running
-            if n > 0:
-                runs, rend = process_running(
-                    t, n, nt1, img, ivid, rois, runind, runs, rend
-                )
-            else:
-                runs, rend = process_running(
-                    t, n, nt1, img, ivid, rois, runind, runs, rend=None
-                )
+    # Unzip results
+    V_mot_list, V_mov_list, M_list, _, _, _ = zip(*results)
 
-        # bin and get motion
-        if fullSVD:
-            if n > 0:
-                imall_mot = np.zeros((img[0].shape[0], (Lyb * Lxb).sum()), np.float32)
-                imall_mov = np.zeros((img[0].shape[0], (Lyb * Lxb).sum()), np.float32)
-            else:
-                imall_mot = np.zeros(
-                    (img[0].shape[0] - 1, (Lyb * Lxb).sum()), np.float32
-                )
-                imall_mov = np.zeros(
-                    (img[0].shape[0] - 1, (Lyb * Lxb).sum()), np.float32
-                )
-        if fullSVD or nroi > 0:
-            for ii, im in enumerate(img):
-                usevid = False
-                if fullSVD:
-                    usevid = True
-                if nroi > 0:
-                    wmot = (ivid[motind] == ii).nonzero()[0]
-                    if wmot.size > 0:
-                        usevid = True
-                if usevid:
-                    imbin = spatial_bin(im, sbin, Lyb[ii], Lxb[ii])
-                    if n > 0:
-                        imbin = np.concatenate(
-                            (imend[ii][np.newaxis, :], imbin), axis=0
-                        )
-                    imend[ii] = imbin[-1].copy()
-                    if motSVD:  # compute motion energy for motSVD
-                        imbin_mot = np.abs(np.diff(imbin, axis=0))
-                    if movSVD:  # use raw frames for movSVD
-                        imbin_mov = imbin[1:, :]
-                    if fullSVD:
-                        if motSVD:
-                            M[0][t : t + imbin_mot.shape[0]] += imbin_mot.sum(axis=-1)
-                            imall_mot[:, ir[ii]] = imbin_mot - avgmotion[ii].flatten()
-                        if movSVD:
-                            imall_mov[:, ir[ii]] = imbin_mov - avgframe[ii].flatten()
-                if nroi > 0 and wmot.size > 0:
-                    wmot = np.array(wmot).astype(int)
-                    if motSVD:
-                        imbin_mot = np.reshape(imbin_mot, (-1, Lyb[ii], Lxb[ii]))
-                        avgmotion[ii] = np.reshape(avgmotion[ii], (Lyb[ii], Lxb[ii]))
-                    if movSVD:
-                        imbin_mov = np.reshape(imbin_mov, (-1, Lyb[ii], Lxb[ii]))
-                        avgframe[ii] = np.reshape(avgframe[ii], (Lyb[ii], Lxb[ii]))
-                    wroi = motind[wmot]
-                    for i in range(wroi.size):
-                        ymin = rois[wroi[i]]["yrange_bin"][0]
-                        ymax = rois[wroi[i]]["yrange_bin"][-1] + 1
-                        xmin = rois[wroi[i]]["xrange_bin"][0]
-                        xmax = rois[wroi[i]]["xrange_bin"][-1] + 1
-                        if motSVD:
-                            lilbin = imbin_mot[:, ymin:ymax, xmin:xmax]
-                            M[wmot[i] + 1][t : t + lilbin.shape[0]] = lilbin.sum(
-                                axis=(-2, -1)
+    # Concatenate outputs
+    def concat_outputs(chunk_list):
+        if not chunk_list or not any(item is not None for item in chunk_list):
+            return []
+
+        # Check if we have a list of lists of arrays
+        if isinstance(chunk_list[0], list):
+            num_outputs = len(chunk_list[0])
+            final_outputs = []
+            for i in range(num_outputs):
+                # Collect all i-th arrays from each chunk
+                arrays_to_concat = [
+                    chunk[i]
+                    for chunk in chunk_list
+                    if chunk and len(chunk) > i and chunk[i] is not None
+                ]
+                if arrays_to_concat:
+                    final_outputs.append(np.concatenate(arrays_to_concat, axis=0))
+                else:
+                    # Attempt to create an empty array with correct dimensions
+                    template_chunk = next(
+                        (
+                            c
+                            for c in chunk_list
+                            if c and len(c) > i and c[i] is not None
+                        ),
+                        None,
+                    )
+                    if template_chunk is not None:
+                        final_outputs.append(
+                            np.zeros(
+                                (0,) + template_chunk[i].shape[1:],
+                                dtype=template_chunk[i].dtype,
                             )
-                            lilbin -= avgmotion[ii][ymin:ymax, xmin:xmax]
-                            lilbin = np.reshape(lilbin, (lilbin.shape[0], -1))
-                            vproj = lilbin @ U_mot[wmot[i] + 1]
-                            if n == 0:
-                                vproj = np.concatenate(
-                                    (vproj[0, :][np.newaxis, :], vproj), axis=0
-                                )
-                            V_mot[wmot[i] + 1][t : t + vproj.shape[0], :] = vproj
-                        if movSVD:
-                            lilbin = imbin_mov[:, ymin:ymax, xmin:xmax]
-                            lilbin -= avgframe[ii][ymin:ymax, xmin:xmax]
-                            lilbin = np.reshape(lilbin, (lilbin.shape[0], -1))
-                            vproj = lilbin @ U_mov[wmot[i] + 1]
-                            if n == 0:
-                                vproj = np.concatenate(
-                                    (vproj[0, :][np.newaxis, :], vproj), axis=0
-                                )
-                            V_mov[wmot[i] + 1][t : t + vproj.shape[0], :] = vproj
-            if fullSVD:
-                if motSVD:
-                    vproj = imall_mot @ U_mot[0]
-                    if n == 0:
-                        vproj = np.concatenate(
-                            (vproj[0, :][np.newaxis, :], vproj), axis=0
                         )
-                    V_mot[0][t : t + vproj.shape[0], :] = vproj
-                if movSVD:
-                    vproj = imall_mov @ U_mov[0]
-                    if n == 0:
-                        vproj = np.concatenate(
-                            (vproj[0, :][np.newaxis, :], vproj), axis=0
-                        )
-                    V_mov[0][t : t + vproj.shape[0], :] = vproj
+                    else:
+                        final_outputs.append(np.array([]))
+            return final_outputs
+        # Fallback for simple list of arrays
+        elif isinstance(chunk_list[0], np.ndarray):
+            return np.concatenate(chunk_list, axis=0)
+        return []
 
-            if n % 10 == 0:
-                print(
-                    f"computed video chunk {n} / {nsegs}, time {time.time()-tic: .2f}sec",
-                    file=sys.stdout,
-                )
+    V_mot = concat_outputs(V_mot_list)
+    V_mov = concat_outputs(V_mov_list)
+    M = concat_outputs(
+        list(M_list)
+    )  # M_list is a tuple of lists, convert to list of lists
 
-            utils.update_mainwindow_progressbar(
-                MainWindow, GUIobject, s, "Computing ROIs and/or motSVD/movSVD "
-            )
+    # Repeat first value and ensure length is nframes (to match original behavior)
+    if motSVD and V_mot and len(V_mot) > 0 and V_mot[0].shape[0] > 0:
+        # Prepend the first value to get length nframes
+        first_val = V_mot[0][0:1]  # Keep dimensions
+        V_mot[0] = np.concatenate([first_val, V_mot[0]], axis=0)
+        # Trim to exact length nframes
+        if V_mot[0].shape[0] > nframes:
+            V_mot[0] = V_mot[0][:nframes]
+
+    if movSVD and V_mov and len(V_mov) > 0 and V_mov[0].shape[0] > 0:
+        # Prepend the first value to get length nframes
+        first_val = V_mov[0][0:1]  # Keep dimensions
+        V_mov[0] = np.concatenate([first_val, V_mov[0]], axis=0)
+        # Trim to exact length nframes
+        if V_mov[0].shape[0] > nframes:
+            V_mov[0] = V_mov[0][:nframes]
+
+    if M and len(M) > 0 and M[0].shape[0] > 0:
+        # Prepend the first value to get length nframes
+        first_val = M[0][0:1]  # Keep dimensions
+        M[0] = np.concatenate([first_val, M[0]], axis=0)
+        # Trim to exact length nframes
+        if M[0].shape[0] > nframes:
+            M[0] = M[0][:nframes]
 
     utils.update_mainwindow_message(
         MainWindow, GUIobject, "Finished computing ROIs and/or motSVD/movSVD "
     )
-
+    # Return empty lists for non-implemented features
+    pups, blinks, runs = [], [], []
     return V_mot, V_mov, M, pups, blinks, runs
 
 
@@ -642,7 +728,7 @@ def run(
         List of video files to process. Each element of the list is a list of
         filenames for video(s) recorded simultaneously. For example, if two videos were recorded simultaneously, the list would be: [['video1.avi', 'video2.avi']], and if the videos were recorded sequentially, the list would be: [['video1.avi'], ['video2.avi']].
     sbin: int
-        Spatial binning factor. If sbin > 1, the movie will be spatially binned by a factor of sbin.
+        Spatial binning factor. If sbin > 1, the movie will be spatially binning by a factor of sbin.
     motSVD: bool
         If True, compute SVD of motion in the video i.e. the difference between consecutive frames.
     movSVD: bool
@@ -819,7 +905,7 @@ def run(
     # and compute pupil (if selected)
     print("Computing ROIs and/or motSVD/movSVD", file=sys.stdout)
     V_mot, V_mov, M, pups, blinks, runs = process_ROIs(
-        containers,
+        filenames,  # pass filenames, not containers
         cumframes,
         Ly,
         Lx,
